@@ -133,10 +133,14 @@ function pfftConfig() {
     autoSubmit: boolFromEnv("PFFT_AUTO_SUBMIT", true),
     continueOnTxError: boolFromEnv("PFFT_CONTINUE_ON_TX_ERROR", true),
     errorBackoffMs: numberFromEnv("PFFT_ERROR_BACKOFF_MS", 5000),
-    gasLimitMultiplierPermille: bigintPermilleFromEnv("PFFT_GAS_LIMIT_MULTIPLIER_PERMILLE", 1200),
-    maxFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_MAX_FEE_MULTIPLIER_PERMILLE", 1200),
-    priorityFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_PRIORITY_FEE_MULTIPLIER_PERMILLE", 1200),
-    minPriorityFeeGwei: process.env.PFFT_MIN_PRIORITY_FEE_GWEI || "1.5",
+    gasStrategy: process.env.PFFT_GAS_STRATEGY || "cheap",
+    gasLimitMultiplierPermille: bigintPermilleFromEnv("PFFT_GAS_LIMIT_MULTIPLIER_PERMILLE", 1100),
+    baseFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_BASE_FEE_MULTIPLIER_PERMILLE", 1050),
+    maxFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_MAX_FEE_MULTIPLIER_PERMILLE", 1000),
+    priorityFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_PRIORITY_FEE_MULTIPLIER_PERMILLE", 1000),
+    feeHistoryBlocks: Math.max(1, Math.floor(numberFromEnv("PFFT_FEE_HISTORY_BLOCKS", 5))),
+    feeHistoryPercentile: Math.max(1, Math.min(99, numberFromEnv("PFFT_FEE_HISTORY_PERCENTILE", 10))),
+    minPriorityFeeGwei: process.env.PFFT_MIN_PRIORITY_FEE_GWEI || "0.05",
     mintCount: Math.max(0, Math.floor(Number(process.env.PFFT_MINT_COUNT || "1"))),
     contractAddress: process.env.PFFT_CONTRACT || CONTRACT_ADDRESS
   };
@@ -351,20 +355,59 @@ function scalePermille(value, multiplierPermille) {
   return (BigInt(value) * multiplierPermille + 999n) / 1000n;
 }
 
+async function rpcCall(provider, method, params) {
+  if (typeof provider.send === "function") return await provider.send(method, params);
+  throw new Error("provider does not support raw RPC calls");
+}
+
+function bigintFromRpcQuantity(value) {
+  if (value === null || value === undefined) return null;
+  return BigInt(value);
+}
+
+async function cheapFeeData(config, provider, fallbackFeeData) {
+  const minPriorityFee = parseUnits(config.minPriorityFeeGwei, "gwei");
+  try {
+    const history = await rpcCall(provider, "eth_feeHistory", [
+      `0x${config.feeHistoryBlocks.toString(16)}`,
+      "latest",
+      [config.feeHistoryPercentile]
+    ]);
+    const baseFees = (history.baseFeePerGas || []).map(bigintFromRpcQuantity).filter((value) => value !== null);
+    const rewards = (history.reward || [])
+      .map((row) => bigintFromRpcQuantity(row?.[0]))
+      .filter((value) => value !== null && value > 0n);
+    const nextBaseFee = baseFees.at(-1) || fallbackFeeData.maxFeePerGas || fallbackFeeData.gasPrice || 0n;
+    const sampledPriority = rewards.length
+      ? rewards.reduce((sum, value) => sum + value, 0n) / BigInt(rewards.length)
+      : fallbackFeeData.maxPriorityFeePerGas || 0n;
+    const maxPriorityFeePerGas = sampledPriority > minPriorityFee ? sampledPriority : minPriorityFee;
+    const maxFeePerGas = scalePermille(nextBaseFee, config.baseFeeMultiplierPermille) + maxPriorityFeePerGas;
+    return { maxFeePerGas, maxPriorityFeePerGas, source: `feeHistory p${config.feeHistoryPercentile}` };
+  } catch (error) {
+    const priorityBase = fallbackFeeData.maxPriorityFeePerGas && fallbackFeeData.maxPriorityFeePerGas > minPriorityFee
+      ? fallbackFeeData.maxPriorityFeePerGas
+      : minPriorityFee;
+    const maxPriorityFeePerGas = scalePermille(priorityBase, config.priorityFeeMultiplierPermille);
+    const feeBase = fallbackFeeData.maxFeePerGas || fallbackFeeData.gasPrice || maxPriorityFeePerGas;
+    let maxFeePerGas = scalePermille(feeBase, config.maxFeeMultiplierPermille);
+    if (maxFeePerGas < maxPriorityFeePerGas) maxFeePerGas = maxPriorityFeePerGas;
+    console.log(`[pfft] feeHistory unavailable, using provider feeData: ${errorMessage(error)}`);
+    return { maxFeePerGas, maxPriorityFeePerGas, source: "provider feeData" };
+  }
+}
+
 async function dynamicTxOverrides(config, contract, solution) {
-  const feeData = await contract.runner.provider.getFeeData();
+  const provider = contract.runner.provider;
+  const feeData = await provider.getFeeData();
   const estimatedGas = await contract.freeMint.estimateGas(solution.powNonce);
   const gasLimit = scalePermille(estimatedGas, config.gasLimitMultiplierPermille);
-  const minPriorityFee = parseUnits(config.minPriorityFeeGwei, "gwei");
-  const priorityBase = feeData.maxPriorityFeePerGas && feeData.maxPriorityFeePerGas > minPriorityFee
-    ? feeData.maxPriorityFeePerGas
-    : minPriorityFee;
-  const maxPriorityFeePerGas = scalePermille(priorityBase, config.priorityFeeMultiplierPermille);
-  const feeBase = feeData.maxFeePerGas || feeData.gasPrice || maxPriorityFeePerGas;
-  let maxFeePerGas = scalePermille(feeBase, config.maxFeeMultiplierPermille);
-  if (maxFeePerGas < maxPriorityFeePerGas) maxFeePerGas = maxPriorityFeePerGas;
+  const dynamicFees = config.gasStrategy === "cheap"
+    ? await cheapFeeData(config, provider, feeData)
+    : await cheapFeeData({ ...config, feeHistoryPercentile: 50 }, provider, feeData);
+  const { maxFeePerGas, maxPriorityFeePerGas, source } = dynamicFees;
 
-  console.log(`[pfft] gas estimate=${estimatedGas.toString()} limit=${gasLimit.toString()} maxFee=${formatGwei(maxFeePerGas)} priority=${formatGwei(maxPriorityFeePerGas)}`);
+  console.log(`[pfft] gas strategy=${config.gasStrategy}/${source} estimate=${estimatedGas.toString()} limit=${gasLimit.toString()} maxFee=${formatGwei(maxFeePerGas)} priority=${formatGwei(maxPriorityFeePerGas)}`);
   return {
     gasLimit,
     maxFeePerGas,
