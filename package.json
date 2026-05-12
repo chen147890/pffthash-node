@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node scripts/pfft-mine.mjs",
     "mine": "node scripts/pfft-mine.mjs",
+    "setup": "bash scripts/pfft-cuda-setup.sh",
     "preflight": "PFFT_PREFLIGHT_ONLY=1 node scripts/pfft-mine.mjs",
     "check": "node --check scripts/pfft-mine.mjs && node --check scripts/pfft-worker.mjs"
   },

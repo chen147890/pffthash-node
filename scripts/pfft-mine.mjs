@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { cpus } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -81,6 +82,24 @@ function expectedAttempts(target) {
   return Number(expected > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : expected);
 }
 
+function uint256Hex(value) {
+  const hex = BigInt(value).toString(16).padStart(64, "0");
+  return `0x${hex}`;
+}
+
+function shouldUseCuda(config) {
+  const mode = config.minerMode.toLowerCase();
+  if (mode === "cpu") return false;
+  if (["cuda", "gpu", "hybrid"].includes(mode)) return true;
+  return existsSync(config.cudaBin);
+}
+
+function shouldUseCpu(config) {
+  const mode = config.minerMode.toLowerCase();
+  if (mode === "cuda" || mode === "gpu") return false;
+  return config.threads > 0;
+}
+
 function pfftConfig() {
   const logicalCores = cpus().length || 1;
   const threadsRaw = process.env.PFFT_THREADS || "auto";
@@ -92,6 +111,12 @@ function pfftConfig() {
     privateKey: process.env.EVM_PRIVATE_KEY || process.env.ETH_PRIVATE_KEY || "",
     threads,
     batchSize: numberFromEnv("PFFT_BATCH_SIZE", 4096),
+    minerMode: process.env.PFFT_MINER_MODE || "auto",
+    cudaBin: join(ROOT, "runtime/bin/pfft-cuda-miner"),
+    cudaDevices: process.env.PFFT_CUDA_DEVICES || "auto",
+    cudaBlocks: numberFromEnv("PFFT_CUDA_BLOCKS", 4096),
+    cudaThreads: numberFromEnv("PFFT_CUDA_THREADS", 256),
+    cudaIterations: numberFromEnv("PFFT_CUDA_ITERATIONS", 64),
     nonceMode: process.env.PFFT_NONCE_MODE === "random" ? "random" : "sequential",
     reportIntervalMs: numberFromEnv("PFFT_REPORT_INTERVAL_MS", 5000),
     minEthBalance: Number(process.env.PFFT_MIN_ETH_BALANCE || "0.003"),
@@ -138,7 +163,9 @@ async function preflight(config, provider, wallet, contract) {
   console.log(`  Bits:      ${bits === null ? "-" : Number(bits)}`);
   console.log(`  Hex zeros: ${zeros === null ? "-" : Number(zeros)}`);
   console.log(`  Challenge: ${challenge}`);
-  console.log(`  Threads:   ${config.threads}`);
+  console.log(`  Mode:      ${config.minerMode}`);
+  console.log(`  CPU:       ${shouldUseCpu(config) ? `${config.threads} threads` : "off"}`);
+  console.log(`  CUDA:      ${shouldUseCuda(config) ? `${config.cudaDevices} devices` : "off"}`);
   console.log(`  Nonces:    ${config.nonceMode}`);
   console.log(`  Submit:    ${config.autoSubmit ? "yes" : "no"}`);
 
@@ -154,14 +181,17 @@ async function mineOnce(config, challenge, target) {
   const workerPath = fileURLToPath(new URL("./pfft-worker.mjs", import.meta.url));
   const startedAt = Date.now();
   const workers = [];
+  let cudaProcess = null;
   const progress = new Map();
   let settled = false;
 
   return await new Promise((resolve, reject) => {
     const stopAll = () => {
       for (const worker of workers) worker.postMessage({ type: "stop" });
+      if (cudaProcess && !cudaProcess.killed) cudaProcess.kill("SIGTERM");
       setTimeout(() => {
         for (const worker of workers) worker.terminate().catch(() => {});
+        if (cudaProcess && !cudaProcess.killed) cudaProcess.kill("SIGKILL");
       }, 250);
     };
 
@@ -179,6 +209,75 @@ async function mineOnce(config, challenge, target) {
       stopAll();
       callback();
     };
+
+    if (shouldUseCuda(config)) {
+      if (!existsSync(config.cudaBin)) {
+        const message = `CUDA miner is missing: ${config.cudaBin}. Run npm run setup on the GPU server.`;
+        const mode = config.minerMode.toLowerCase();
+        if (mode === "cuda" || mode === "gpu") {
+          finish(() => reject(new Error(message)));
+          return;
+        }
+        console.log(`[pfft] ${message} Falling back to CPU.`);
+      } else {
+        const args = [
+          "--challenge", challenge,
+          "--target", uint256Hex(target),
+          "--devices", config.cudaDevices,
+          "--blocks", String(config.cudaBlocks),
+          "--threads", String(config.cudaThreads),
+          "--iterations", String(config.cudaIterations),
+          "--report-ms", String(config.reportIntervalMs)
+        ];
+        cudaProcess = spawn(config.cudaBin, args, { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] });
+        let buffer = "";
+        cudaProcess.stdout.on("data", (chunk) => {
+          buffer += chunk.toString();
+          let newline = buffer.indexOf("\n");
+          while (newline !== -1) {
+            const line = buffer.slice(0, newline).trim();
+            buffer = buffer.slice(newline + 1);
+            newline = buffer.indexOf("\n");
+            if (!line) continue;
+            try {
+              const message = JSON.parse(line);
+              if (message.type === "progress") {
+                progress.set("cuda", { attempts: BigInt(message.attempts || "0") });
+                continue;
+              }
+              if (message.type === "solved") {
+                progress.set("cuda", { attempts: BigInt(message.attempts || "0") });
+                const attempts = [...progress.values()].reduce((sum, item) => sum + item.attempts, 0n);
+                const elapsedMs = Date.now() - startedAt;
+                const hashrate = elapsedMs > 0 ? Number(attempts) / elapsedMs * 1000 : 0;
+                finish(() => resolve({
+                  powNonce: BigInt(message.powNonce),
+                  hash: message.hash,
+                  attempts,
+                  elapsedMs,
+                  hashrate,
+                  engine: `cuda:${message.device}`
+                }));
+              }
+            } catch {
+              console.log(`[cuda] ${line}`);
+            }
+          }
+        });
+        cudaProcess.stderr.on("data", (chunk) => {
+          for (const line of chunk.toString().split(/\r?\n/).filter(Boolean)) console.error(`[cuda] ${line}`);
+        });
+        cudaProcess.on("exit", (code, signal) => {
+          if (settled || signal) return;
+          const mode = config.minerMode.toLowerCase();
+          if ((mode === "cuda" || mode === "gpu") && code !== 0) {
+            finish(() => reject(new Error(`CUDA miner exited with code ${code}`)));
+          }
+        });
+      }
+    }
+
+    if (!shouldUseCpu(config)) return;
 
     for (let workerId = 0; workerId < config.threads; workerId += 1) {
       const worker = new Worker(workerPath, {
@@ -209,7 +308,8 @@ async function mineOnce(config, challenge, target) {
             hash: message.hash,
             attempts,
             elapsedMs,
-            hashrate
+            hashrate,
+            engine: `cpu:${message.workerId}`
           }));
           return;
         }
@@ -272,7 +372,7 @@ async function main() {
 
       const solution = await mineOnce(config, challenge, target);
       console.log(`[pfft] solved nonce=${solution.powNonce.toString()} hash=${solution.hash}`);
-      console.log(`[pfft] attempts=${solution.attempts.toString()} rate=${formatHashrate(solution.hashrate)} elapsed=${formatDuration(solution.elapsedMs)}`);
+      console.log(`[pfft] engine=${solution.engine || "unknown"} attempts=${solution.attempts.toString()} rate=${formatHashrate(solution.hashrate)} elapsed=${formatDuration(solution.elapsedMs)}`);
 
       if (!config.autoSubmit) {
         console.log("[pfft] PFFT_AUTO_SUBMIT=0, not sending transaction.");
