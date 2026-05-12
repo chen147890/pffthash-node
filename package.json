@@ -1,0 +1,16 @@
+{
+  "name": "pffthash-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/pfft-mine.mjs",
+    "mine": "node scripts/pfft-mine.mjs",
+    "preflight": "PFFT_PREFLIGHT_ONLY=1 node scripts/pfft-mine.mjs",
+    "check": "node --check scripts/pfft-mine.mjs && node --check scripts/pfft-worker.mjs"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "ethers": "^6.16.0"
+  }
+}
