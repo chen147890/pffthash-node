@@ -49,3 +49,4 @@ npm start
 - `PFFT_THREADS=auto` uses all logical CPU cores on Mac or Ubuntu.
 - `PFFT_MINT_COUNT=1` exits after one confirmed mint.
 - `PFFT_MINT_COUNT=0` keeps mining in a loop.
+- `PFFT_CONTINUE_ON_TX_ERROR=1` keeps the miner running after reverted or failed mint transactions.

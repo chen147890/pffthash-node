@@ -96,6 +96,8 @@ function pfftConfig() {
     reportIntervalMs: numberFromEnv("PFFT_REPORT_INTERVAL_MS", 5000),
     minEthBalance: Number(process.env.PFFT_MIN_ETH_BALANCE || "0.003"),
     autoSubmit: boolFromEnv("PFFT_AUTO_SUBMIT", true),
+    continueOnTxError: boolFromEnv("PFFT_CONTINUE_ON_TX_ERROR", true),
+    errorBackoffMs: numberFromEnv("PFFT_ERROR_BACKOFF_MS", 5000),
     mintCount: Math.max(0, Math.floor(Number(process.env.PFFT_MINT_COUNT || "1"))),
     contractAddress: process.env.PFFT_CONTRACT || CONTRACT_ADDRESS
   };
@@ -223,6 +225,26 @@ async function mineOnce(config, challenge, target) {
   });
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error) {
+  return error?.shortMessage || error?.reason || error?.message || String(error);
+}
+
+async function submitSolution(contract, solution) {
+  console.log("[pfft] checking freeMint(powNonce)...");
+  await contract.freeMint.staticCall(solution.powNonce);
+  console.log("[pfft] sending freeMint(powNonce)...");
+  const tx = await contract.freeMint(solution.powNonce);
+  console.log(`[pfft] tx sent: ${tx.hash}`);
+  const receipt = await tx.wait();
+  if (receipt.status !== 1) throw new Error(`Transaction failed: ${tx.hash}`);
+  console.log(`[pfft] confirmed in block ${receipt.blockNumber}: ${tx.hash}`);
+  return receipt;
+}
+
 async function main() {
   loadEnvFile();
   const config = pfftConfig();
@@ -234,34 +256,41 @@ async function main() {
   const provider = new JsonRpcProvider(config.rpcUrl, 1, { staticNetwork: true });
   const wallet = new Wallet(config.privateKey, provider);
   const contract = new Contract(config.contractAddress, ABI, wallet);
-  const rounds = config.mintCount === 0 ? Number.POSITIVE_INFINITY : config.mintCount;
+  const targetMints = config.mintCount === 0 ? Number.POSITIVE_INFINITY : config.mintCount;
+  let completedMints = 0;
+  let attempts = 0;
 
-  for (let round = 1; round <= rounds; round += 1) {
+  while (completedMints < targetMints) {
+    attempts += 1;
     console.log("");
-    console.log(`PFFT mining round ${round}${config.mintCount === 0 ? " (infinite)" : `/${config.mintCount}`}`);
-    const { challenge, target, expected } = await preflight(config, provider, wallet, contract);
-    if (expected) console.log(`  Expected:  ~${Math.round(expected).toLocaleString()} tries`);
-    if (process.env.PFFT_PREFLIGHT_ONLY === "1") return;
+    console.log(`PFFT mining attempt ${attempts}${config.mintCount === 0 ? " (continuous)" : `, confirmed ${completedMints}/${config.mintCount}`}`);
 
-    const solution = await mineOnce(config, challenge, target);
-    console.log(`[pfft] solved nonce=${solution.powNonce.toString()} hash=${solution.hash}`);
-    console.log(`[pfft] attempts=${solution.attempts.toString()} rate=${formatHashrate(solution.hashrate)} elapsed=${formatDuration(solution.elapsedMs)}`);
+    try {
+      const { challenge, target, expected } = await preflight(config, provider, wallet, contract);
+      if (expected) console.log(`  Expected:  ~${Math.round(expected).toLocaleString()} tries`);
+      if (process.env.PFFT_PREFLIGHT_ONLY === "1") return;
 
-    if (!config.autoSubmit) {
-      console.log("[pfft] PFFT_AUTO_SUBMIT=0, not sending transaction.");
-      continue;
+      const solution = await mineOnce(config, challenge, target);
+      console.log(`[pfft] solved nonce=${solution.powNonce.toString()} hash=${solution.hash}`);
+      console.log(`[pfft] attempts=${solution.attempts.toString()} rate=${formatHashrate(solution.hashrate)} elapsed=${formatDuration(solution.elapsedMs)}`);
+
+      if (!config.autoSubmit) {
+        console.log("[pfft] PFFT_AUTO_SUBMIT=0, not sending transaction.");
+        continue;
+      }
+
+      await submitSolution(contract, solution);
+      completedMints += 1;
+    } catch (error) {
+      console.error(`[pfft] attempt ${attempts} failed: ${errorMessage(error)}`);
+      if (!config.continueOnTxError) throw error;
+      console.log(`[pfft] continuing in ${formatDuration(config.errorBackoffMs)}. A revert can happen if the solved nonce became stale or the contract rejected the mint.`);
+      await sleep(config.errorBackoffMs);
     }
-
-    console.log("[pfft] sending freeMint(powNonce)...");
-    const tx = await contract.freeMint(solution.powNonce);
-    console.log(`[pfft] tx sent: ${tx.hash}`);
-    const receipt = await tx.wait();
-    if (receipt.status !== 1) throw new Error(`Transaction failed: ${tx.hash}`);
-    console.log(`[pfft] confirmed in block ${receipt.blockNumber}: ${tx.hash}`);
   }
 }
 
 main().catch((error) => {
-  console.error(`Error: ${error?.shortMessage || error?.reason || error?.message || String(error)}`);
+  console.error(`Error: ${errorMessage(error)}`);
   process.exit(1);
 });
