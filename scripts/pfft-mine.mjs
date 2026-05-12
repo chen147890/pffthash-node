@@ -4,7 +4,7 @@ import { cpus } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import { Contract, JsonRpcProvider, Wallet, formatEther, formatUnits } from "ethers";
+import { Contract, JsonRpcProvider, Wallet, formatEther, formatUnits, parseUnits } from "ethers";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CONTRACT_ADDRESS = "0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB";
@@ -58,6 +58,11 @@ function boolFromEnv(name, fallback) {
   return !["0", "false", "no", "off"].includes(raw.toLowerCase());
 }
 
+function bigintPermilleFromEnv(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  return BigInt(Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback);
+}
+
 function formatHashrate(value) {
   if (!Number.isFinite(value) || value <= 0) return "0 H/s";
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)} MH/s`;
@@ -73,6 +78,11 @@ function formatDuration(ms) {
   if (hours) return `${hours}h ${minutes}m ${seconds}s`;
   if (minutes) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
+}
+
+function formatGwei(value) {
+  if (value === null || value === undefined) return "-";
+  return `${Number(formatUnits(value, "gwei")).toFixed(3)} gwei`;
 }
 
 function expectedAttempts(target) {
@@ -123,6 +133,10 @@ function pfftConfig() {
     autoSubmit: boolFromEnv("PFFT_AUTO_SUBMIT", true),
     continueOnTxError: boolFromEnv("PFFT_CONTINUE_ON_TX_ERROR", true),
     errorBackoffMs: numberFromEnv("PFFT_ERROR_BACKOFF_MS", 5000),
+    gasLimitMultiplierPermille: bigintPermilleFromEnv("PFFT_GAS_LIMIT_MULTIPLIER_PERMILLE", 1200),
+    maxFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_MAX_FEE_MULTIPLIER_PERMILLE", 1200),
+    priorityFeeMultiplierPermille: bigintPermilleFromEnv("PFFT_PRIORITY_FEE_MULTIPLIER_PERMILLE", 1200),
+    minPriorityFeeGwei: process.env.PFFT_MIN_PRIORITY_FEE_GWEI || "1.5",
     mintCount: Math.max(0, Math.floor(Number(process.env.PFFT_MINT_COUNT || "1"))),
     contractAddress: process.env.PFFT_CONTRACT || CONTRACT_ADDRESS
   };
@@ -333,11 +347,37 @@ function errorMessage(error) {
   return error?.shortMessage || error?.reason || error?.message || String(error);
 }
 
-async function submitSolution(contract, solution) {
+function scalePermille(value, multiplierPermille) {
+  return (BigInt(value) * multiplierPermille + 999n) / 1000n;
+}
+
+async function dynamicTxOverrides(config, contract, solution) {
+  const feeData = await contract.runner.provider.getFeeData();
+  const estimatedGas = await contract.freeMint.estimateGas(solution.powNonce);
+  const gasLimit = scalePermille(estimatedGas, config.gasLimitMultiplierPermille);
+  const minPriorityFee = parseUnits(config.minPriorityFeeGwei, "gwei");
+  const priorityBase = feeData.maxPriorityFeePerGas && feeData.maxPriorityFeePerGas > minPriorityFee
+    ? feeData.maxPriorityFeePerGas
+    : minPriorityFee;
+  const maxPriorityFeePerGas = scalePermille(priorityBase, config.priorityFeeMultiplierPermille);
+  const feeBase = feeData.maxFeePerGas || feeData.gasPrice || maxPriorityFeePerGas;
+  let maxFeePerGas = scalePermille(feeBase, config.maxFeeMultiplierPermille);
+  if (maxFeePerGas < maxPriorityFeePerGas) maxFeePerGas = maxPriorityFeePerGas;
+
+  console.log(`[pfft] gas estimate=${estimatedGas.toString()} limit=${gasLimit.toString()} maxFee=${formatGwei(maxFeePerGas)} priority=${formatGwei(maxPriorityFeePerGas)}`);
+  return {
+    gasLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas
+  };
+}
+
+async function submitSolution(config, contract, solution) {
   console.log("[pfft] checking freeMint(powNonce)...");
   await contract.freeMint.staticCall(solution.powNonce);
+  const overrides = await dynamicTxOverrides(config, contract, solution);
   console.log("[pfft] sending freeMint(powNonce)...");
-  const tx = await contract.freeMint(solution.powNonce);
+  const tx = await contract.freeMint(solution.powNonce, overrides);
   console.log(`[pfft] tx sent: ${tx.hash}`);
   const receipt = await tx.wait();
   if (receipt.status !== 1) throw new Error(`Transaction failed: ${tx.hash}`);
@@ -379,7 +419,7 @@ async function main() {
         continue;
       }
 
-      await submitSolution(contract, solution);
+      await submitSolution(config, contract, solution);
       completedMints += 1;
     } catch (error) {
       console.error(`[pfft] attempt ${attempts} failed: ${errorMessage(error)}`);
